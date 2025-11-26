@@ -3,6 +3,7 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
+import flash_attn
 from flash_attn import flash_attn_varlen_qkvpacked_func, flash_attn_varlen_func
 from transformer.utils import seqlen2cu_len
 class MultiHeadSelfAttention_Flash(nn.Module):

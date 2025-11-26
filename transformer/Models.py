@@ -1,4 +1,3 @@
-# love NMISS #
 ''' Define the Transformer model '''
 from multiprocessing import context
 import torch
