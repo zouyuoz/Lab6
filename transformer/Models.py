@@ -223,54 +223,43 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             ###############################################
         return logits # YOU NEED TO RETURN THE FILTERED RAW LOGITS, NOT PROBABILITIES
 
-    @torch.no_grad()
     def generate(
         self,
-        src_input_ids: torch.Tensor,
+        input_ids: torch.Tensor,
         src_seq_len: torch.Tensor,
-        max_len: int = 50,
-        bos_id: int = 1,
-        eos_id: int = 2,
-        sampling: bool = True,
-        top_k: int = 0,
+        generation_limit: int,
+        sampling: bool = False,
+        top_k: int = 10,
         top_p: float = 0.9,
-    ) -> List[List[int]]:
-        """
-        Inference method for beam search or greedy/sampling decoding.
-        Currently only supports greedy/sampling decoding.
-        """
-        self.eval()
-        device = src_input_ids.device
-        batch_size = src_input_ids.size(0)
+    ) -> List[str]:
+        device = self.output_projection.weight.device
+        src_seq_len = src_seq_len.to(device=device, dtype=torch.int32)
+        bsz = src_seq_len.size(0)
 
-        # 1. Encoder Step
-        # The encoder output (enc_output) and source sequence length (src_seq_len)
-        # remain constant throughout the decoding process.
-        enc_output = self.encoder(src_input_ids, src_seq_len)
+        # 1. Encoder Step (Missing in your upload)
+        dummy_mask = torch.tensor(1, device=device)
+        src_cu_seqlens = seqlen2cu_len(src_seq_len)
+        max_src_len = src_seq_len.max().item()
+        enc_outputs = self.encoder(
+            input_ids=input_ids,
+            attention_mask=dummy_mask,
+            cu_seqlens=src_cu_seqlens,
+            max_seqlen=max_src_len,
+            batch_size=bsz
+        )
+        enc_output = enc_outputs["last_hidden_state"] # shape: (total_src_seq_len, d_model)
         
-        # 2. Initialization
-        # 'sequences' holds the generated token IDs for each sequence in the batch.
-        # Start all sequences with the <BOS> token.
-        sequences: List[List[int]] = [[bos_id] for _ in range(batch_size)]
-        
-        # 'finished' flags whether a sequence has generated the <EOS> token.
-        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        
-        # 'sequence_log_probs' is for tracking log probabilities (not strictly needed for greedy/simple sampling)
-        # but initialized for robustness. We use a list of 0.0 for simple sampling/greedy search.
-        sequence_log_probs: List[float] = [0.0] * batch_size
+        # 2. Initialization (Missing in your upload)
+        bos_id = self.tokenizer.cls_token_id # Use CLS_ID as BOS based on Const.py
+        # Store sequences as tensors for efficiency
+        sequences: List[torch.Tensor] = [torch.tensor([bos_id], dtype=torch.long, device=device) for _ in range(bsz)]
+        finished = torch.zeros(bsz, dtype=torch.bool, device=device)
 
-        # 3. Decoding Loop
-        for _ in range(max_len):
-            if finished.all():
-                break
-
-            ############### THE CORE DECODING LOGIC #############
+        for _ in range(generation_limit):
+            ############### YOUR CODE STARTS HERE #############
             # 1. PREPARE trg_input_ids AND trg_seq_len FROM sequences
-            # Flatten all current sequences into a single packed tensor for the Decoder.
-            trg_input_ids = torch.cat([torch.tensor(s, dtype=torch.long, device=device) for s in sequences])
-            # The length of each sequence in the current batch.
-            trg_seq_len = torch.tensor([len(s) for s in sequences], dtype=torch.int32, device=device)
+            trg_input_ids = torch.cat(sequences)
+            trg_seq_len = torch.tensor([s.size(0) for s in sequences], dtype=torch.int32, device=device)
 
             # 2. CALL THE DECODER AND OUTPUT PROJECTION TO GET next_token_logits
             dec_output = self.decoder(
@@ -284,38 +273,48 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             logits = self.output_projection(dec_output) # (total_trg_tokens, vocab_size)
 
             # Get the logit for the next token (the logit of the last token in each sequence)
-            # Find the index of the last token in each sequence within the packed tensor.
             cu_seqlens_no_pad = torch.cumsum(trg_seq_len, dim=0, dtype=torch.long)
-            # Indices for the last token of each sequence (e.g., [L1-1, L1+L2-1, ...])
             last_token_indices = cu_seqlens_no_pad - 1 
             
-            # Extract the logits for the next step for each sequence in the batch.
             next_token_logits = logits[last_token_indices]
-            
-            # 3. APPLY top_k_top_p_filtering IF sampling IS True
+            ###################################################
+
+            if finished.any():
+                next_token_logits[finished] = -float("inf")
+                next_token_logits[
+                    finished, self.tokenizer.pad_token_id
+                ] = 0.0  # keep PAD sticky
+
             if sampling:
-                filtered_logits = self.top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
-                probs = F.softmax(filtered_logits, dim=-1)
-                # Sample the next token
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                filtered_logits = self.top_k_top_p_filtering(
+                    next_token_logits,
+                    top_k=top_k,
+                    top_p=top_p,
+                )
+                probabilities = torch.softmax(filtered_logits, dim=-1)
+                next_token = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
             else:
-                # Greedy search: take the argmax
-                next_tokens = torch.argmax(next_token_logits, dim=-1)
+                next_token = torch.argmax(next_token_logits, dim=-1)
 
-            # 4. UPDATE sequences AND finished FLAGS
-            for i in range(batch_size):
-                if finished[i]:
-                    # Do nothing if the sequence is already finished
+            for idx in range(bsz):
+                if finished[idx]:
                     continue
-                
-                next_token = next_tokens[i].item()
-                sequences[i].append(next_token)
-                
-                # Update finished status if EOS is generated
-                if next_token == eos_id:
-                    finished[i] = True
+                sequences[idx] = torch.cat(
+                    [sequences[idx], next_token[idx].view(1)]
+                )
+                if next_token[idx].item() == self.tokenizer.sep_token_id:
+                    finished[idx] = True
 
-        return sequences
+            if bool(torch.all(finished)):
+                break
+
+        output_text: List[str] = []
+        for seq in sequences:
+            tokens = seq.tolist()
+            if self.tokenizer.sep_token_id in tokens:
+                tokens = tokens[: tokens.index(self.tokenizer.sep_token_id)]
+            output_text.append(self.tokenizer.decode(tokens, skip_special_tokens=True))
+        return output_text
 
     def _cast_modules_to_dtype(self, dtype: Optional[torch.dtype]) -> None:
         if dtype is None:
