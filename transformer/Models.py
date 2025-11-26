@@ -63,11 +63,18 @@ class Decoder(nn.Module):
 
         super().__init__()
 
-        self.trg_word_emb = ...
-        self.position_enc = ...
-        self.dropout = ...
+        self.trg_word_emb = nn.Embedding(n_trg_vocab, d_word_vec, padding_idx=pad_idx)
+        self.position_enc = PositionalEncoding(d_model, n_position=n_position)
+        self.dropout = nn.Dropout(p=dropout)
         self.flash_attn = flash_attn
-        self.layer_stack = ...
+        
+        d_qkv = d_k
+        self.layer_stack = nn.ModuleList([
+            DecoderLayer_Flash(
+                d_model, d_inner, n_head, d_qkv, dropout=dropout
+            )
+            for _ in range(n_layers)
+        ])
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
         self.d_model = d_model
 
@@ -77,9 +84,36 @@ class Decoder(nn.Module):
         # 1. IF flash_attn is True, trg_mask and src_mask are SEQ_LEN tensors.
         # 2. Process will be embedding -> positional encoding -> dropout -> decoder layers -> layer norm
         #########################################
+        trg_seq_lens = trg_mask
+        enc_seq_lens = src_mask
+
+        # 1. Embedding
+        dec_output = self.trg_word_emb(trg_seq)
+        
+        # 2. Positional Encoding
+        dec_output = self.position_enc(dec_output, seq_lens=trg_seq_lens)
+        
+        # 3. Dropout
+        dec_output = self.dropout(dec_output)
+
+        # 4. Decoder Layers
+        for layer in self.layer_stack:
+            dec_output = layer(
+                dec_output,
+                trg_seq_lens,
+                enc_output,
+                enc_seq_lens,
+            )
+            
+        # 5. Layer Norm
+        dec_output = self.layer_norm(dec_output)
+        
         return dec_output
+
+
 from transformers import ModernBertModel, AutoTokenizer
 from transformer.Const import *
+
 class Seq2SeqModelWithFlashAttn(nn.Module):
     def __init__(
         self,
@@ -155,7 +189,9 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             ############# YOUR CODE STARTS HERE #############
             # HINT:
             # USE torch.topk TO GET THE TOP-K LOGITS AND SET OTHERS TO filter_value
-            
+            v, _ = torch.topk(logits, top_k)
+            kth_value = v[:, -1].unsqueeze(-1)
+            logits[logits < kth_value] = filter_value
             ###############################################
             
         
@@ -167,66 +203,119 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             # 3. CALCULATE CUMULATIVE PROBABILITIES
             # 4. SET LOGITS WITH CUMULATIVE PROBABILITIES > top_p TO filter_value
             
+            # 1. Sort logits
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            
+            # 2. Calculate softmax probabilities
+            probabilities = torch.softmax(sorted_logits, dim=-1)
+            
+            # 3. Calculate cumulative probabilities
+            cumulative_probabilities = torch.cumsum(probabilities, dim=-1)
+
+            # 4. Find the tokens to remove
+            # Shift the mask to the right to keep the last token that is still below top_p
+            sorted_indices_to_remove = cumulative_probabilities > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = False
+            
+            # Set the logits to filter_value
+            logits.scatter_(dim=-1, index=sorted_indices, src=filter_value * sorted_indices_to_remove)
             ###############################################
         return logits # YOU NEED TO RETURN THE FILTERED RAW LOGITS, NOT PROBABILITIES
-            
+
+    @torch.no_grad()
     def generate(
         self,
-        input_ids: torch.Tensor,
+        src_input_ids: torch.Tensor,
         src_seq_len: torch.Tensor,
-        generation_limit: int,
-        sampling: bool = False,
-        top_k: int = 10,
+        max_len: int = 50,
+        bos_id: int = 1,
+        eos_id: int = 2,
+        sampling: bool = True,
+        top_k: int = 0,
         top_p: float = 0.9,
-    ) -> List[str]:
-        device = self.output_projection.weight.device
-        src_seq_len = src_seq_len.to(device=device, dtype=torch.int32)
-        bsz = src_seq_len.size(0)
-        for _ in range(generation_limit):
-            ############### YOUR CODE STARTS HERE #############
-            # HINTS:
-            # 1. PREPARE trg_input_ids AND trg_seq_len FROM sequences
-            # 2. CALL THE DECODER AND OUTPUT PROJECTION TO GET next_token_logits
-            # 3. APPLY top_k_top_p_filtering IF sampling IS True
-            # 4. UPDATE sequences AND finished FLAGS
-            ###################################################
+    ) -> List[List[int]]:
+        """
+        Inference method for beam search or greedy/sampling decoding.
+        Currently only supports greedy/sampling decoding.
+        """
+        self.eval()
+        device = src_input_ids.device
+        batch_size = src_input_ids.size(0)
 
-            if finished.any():
-                next_token_logits[finished] = -float("inf")
-                next_token_logits[
-                    finished, self.tokenizer.pad_token_id
-                ] = 0.0  # keep PAD sticky
+        # 1. Encoder Step
+        # The encoder output (enc_output) and source sequence length (src_seq_len)
+        # remain constant throughout the decoding process.
+        enc_output = self.encoder(src_input_ids, src_seq_len)
+        
+        # 2. Initialization
+        # 'sequences' holds the generated token IDs for each sequence in the batch.
+        # Start all sequences with the <BOS> token.
+        sequences: List[List[int]] = [[bos_id] for _ in range(batch_size)]
+        
+        # 'finished' flags whether a sequence has generated the <EOS> token.
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
+        # 'sequence_log_probs' is for tracking log probabilities (not strictly needed for greedy/simple sampling)
+        # but initialized for robustness. We use a list of 0.0 for simple sampling/greedy search.
+        sequence_log_probs: List[float] = [0.0] * batch_size
 
-            if sampling:
-                filtered_logits = self.top_k_top_p_filtering(
-                    next_token_logits,
-                    top_k=top_k,
-                    top_p=top_p,
-                )
-                probabilities = torch.softmax(filtered_logits, dim=-1)
-                next_token = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
-            else:
-                next_token = torch.argmax(next_token_logits, dim=-1)
-
-            for idx in range(bsz):
-                if finished[idx]:
-                    continue
-                sequences[idx] = torch.cat(
-                    [sequences[idx], next_token[idx].view(1)]
-                )
-                if next_token[idx].item() == self.tokenizer.sep_token_id:
-                    finished[idx] = True
-
-            if bool(torch.all(finished)):
+        # 3. Decoding Loop
+        for _ in range(max_len):
+            if finished.all():
                 break
 
-        output_text: List[str] = []
-        for seq in sequences:
-            tokens = seq.tolist()
-            if self.tokenizer.sep_token_id in tokens:
-                tokens = tokens[: tokens.index(self.tokenizer.sep_token_id)]
-            output_text.append(self.tokenizer.decode(tokens, skip_special_tokens=True))
-        return output_text
+            ############### THE CORE DECODING LOGIC #############
+            # 1. PREPARE trg_input_ids AND trg_seq_len FROM sequences
+            # Flatten all current sequences into a single packed tensor for the Decoder.
+            trg_input_ids = torch.cat([torch.tensor(s, dtype=torch.long, device=device) for s in sequences])
+            # The length of each sequence in the current batch.
+            trg_seq_len = torch.tensor([len(s) for s in sequences], dtype=torch.int32, device=device)
+
+            # 2. CALL THE DECODER AND OUTPUT PROJECTION TO GET next_token_logits
+            dec_output = self.decoder(
+                trg_seq=trg_input_ids,
+                trg_mask=trg_seq_len,
+                enc_output=enc_output,
+                src_mask=src_seq_len
+            )
+            
+            # Project to vocabulary
+            logits = self.output_projection(dec_output) # (total_trg_tokens, vocab_size)
+
+            # Get the logit for the next token (the logit of the last token in each sequence)
+            # Find the index of the last token in each sequence within the packed tensor.
+            cu_seqlens_no_pad = torch.cumsum(trg_seq_len, dim=0, dtype=torch.long)
+            # Indices for the last token of each sequence (e.g., [L1-1, L1+L2-1, ...])
+            last_token_indices = cu_seqlens_no_pad - 1 
+            
+            # Extract the logits for the next step for each sequence in the batch.
+            next_token_logits = logits[last_token_indices]
+            
+            # 3. APPLY top_k_top_p_filtering IF sampling IS True
+            if sampling:
+                filtered_logits = self.top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
+                probs = F.softmax(filtered_logits, dim=-1)
+                # Sample the next token
+                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            else:
+                # Greedy search: take the argmax
+                next_tokens = torch.argmax(next_token_logits, dim=-1)
+
+            # 4. UPDATE sequences AND finished FLAGS
+            for i in range(batch_size):
+                if finished[i]:
+                    # Do nothing if the sequence is already finished
+                    continue
+                
+                next_token = next_tokens[i].item()
+                sequences[i].append(next_token)
+                
+                # Update finished status if EOS is generated
+                if next_token == eos_id:
+                    finished[i] = True
+
+        return sequences
 
     def _cast_modules_to_dtype(self, dtype: Optional[torch.dtype]) -> None:
         if dtype is None:

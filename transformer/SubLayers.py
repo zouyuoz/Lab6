@@ -12,8 +12,8 @@ class MultiHeadSelfAttention_Flash(nn.Module):
         super().__init__()
         self.n_head = n_head
         self.d_qkv = d_qkv
-        self.w_qkv = ...
-        self.w_o = ...
+        self.w_qkv = nn.Linear(d_model, 3 * d_model, bias=False) # QKV projection (d_model -> 3 * d_model)
+        self.w_o = nn.Linear(d_model, d_model, bias=False) # Output projection (d_model -> d_model)
         self.dropout_rate = dropout
         self.dropout_layer = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
@@ -24,18 +24,27 @@ class MultiHeadSelfAttention_Flash(nn.Module):
         drop_rate = self.dropout_rate if self.training else 0.0
         residual = x
         ################# YOUR CODE HERE #################
-        # Hints: 
-        # 1. use self.w_qkv to get qkv
+        # 1. use self.w_qkv to get qkv and reshape to (total_len, 3, n_head, d_qkv)
+        qkv = self.w_qkv(x)
+        qkv_packed = qkv.view(-1, 3, self.n_head, self.d_qkv) 
+
         # 2. change seq_lens to cu_seqlens by using seqlen2cu_len function
+        cu_seqlens = seqlen2cu_len(seq_lens)
+        
         # 3. get max_len from seq_lens
+        max_len = seq_lens.max().item()
         ##################################################
         
         output = flash_attn_varlen_qkvpacked_func(qkv_packed, cu_seqlens, max_len, dropout_p=drop_rate, causal=self.causal)
         output = output.reshape(-1, self.n_head * self.d_qkv)
         ################# YOUR CODE HERE ###################
-        # Hints:
         # 1. use self.w_o to project output back to d_model
+        output = self.w_o(output)
+        
         # 2. apply dropout, residual connection and layer norm
+        output = self.dropout_layer(output)
+        output += residual
+        output = self.layer_norm(output)
         ##################################################
         return output
 
@@ -44,9 +53,9 @@ class MultiHeadCrossAttention_Flash(nn.Module):
         super().__init__()
         self.n_head = n_head
         self.d_qkv = d_qkv
-        self.w_q = ...
-        self.w_kv = ...
-        self.w_o = ...
+        self.w_q = nn.Linear(d_model, d_model, bias=False)
+        self.w_kv = nn.Linear(d_model, 2 * d_model, bias=False)
+        self.w_o = nn.Linear(d_model, d_model, bias=False)
         self.dropout_layer = nn.Dropout(dropout)
         self.dropout_rate = dropout
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
@@ -59,10 +68,18 @@ class MultiHeadCrossAttention_Flash(nn.Module):
         drop_rate = self.dropout_rate if self.training else 0.0 # flash attention won't change dropout rate to 0 during eval automatically
         residual = x_q
         ################# YOUR CODE HERE #################
-        # Hints: 
         # 1. use self.w_q, self.w_kv to get q, k, v
+        q = self.w_q(x_q).view(-1, self.n_head, self.d_qkv)
+        kv = self.w_kv(x_kv).view(-1, 2, self.n_head, self.d_qkv)
+        k, v = kv.unbind(1)
+
         # 2. change seq_lens to cu_seqlens by using seqlen2cu_len function
-        # 3. get max_len_q and max_len_kv from seq_lens_q
+        cu_seqlens_q = seqlen2cu_len(seq_lens_q)
+        cu_seqlens_kv = seqlen2cu_len(seq_lens_kv)
+
+        # 3. get max_len_q and max_len_kv from seq_lens
+        max_len_q = seq_lens_q.max().item()
+        max_len_kv = seq_lens_kv.max().item()
         ##################################################
         # output shape: (total_tokens_q, n_head, d_kv)
         output = flash_attn_varlen_func(
@@ -77,9 +94,13 @@ class MultiHeadCrossAttention_Flash(nn.Module):
             causal=self.causal, # flash attention will handle causal masking inside
         )
         ################# YOUR CODE HERE ###################
-        # Hints:
         # 1. use self.w_o to project output back to d_model
+        output = self.w_o(output.reshape(-1, self.n_head * self.d_qkv))
+        
         # 2. apply dropout, residual connection and layer norm
+        output = self.dropout_layer(output)
+        output += residual
+        output = self.layer_norm(output)
         ##################################################
         return output
     
