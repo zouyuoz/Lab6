@@ -4,6 +4,7 @@ import csv
 import torch
 from transformer.Constants import *
 from torch.utils.data import Dataset
+from torch.nn.utils.rnn import pad_sequence
 from datasets import load_dataset
 from transformers import PreTrainedTokenizerBase
 class SquadSeq2SeqDataset(Dataset):
@@ -149,28 +150,30 @@ class SquadSeq2SeqDataset(Dataset):
 def QACollator(batch: List[Dict[str, List[int]]]) -> Dict[str, torch.Tensor]:
     if not batch:
         raise ValueError("Empty batch provided to collator.")
-    src_tokens: List[int] = []
-    tgt_tokens: List[int] = []
-    src_lens: List[int] = []
-    tgt_lens: List[int] = []
-    id_s = []
-    for item in batch:
-        id_s.append(item["id"])
         
-        # Sequence packing for source
-        src_tokens.extend(item["input_ids"])
-        src_lens.append(len(item["input_ids"]))
+    id_s = [item["id"] for item in batch]
+    
+    # 1. Padding Source Sequences (src)
+    src_tensors = [torch.tensor(item["input_ids"], dtype=torch.long) for item in batch]
+    # 使用 pad_sequence 補齊到最大長度 (Padding value 使用 PAD_ID)
+    src_padded = pad_sequence(src_tensors, batch_first=True, padding_value=PAD_ID)
+    src_lens = torch.tensor([len(s) for s in src_tensors], dtype=torch.int32) # 保持 src_len 輸出
 
-        # Sequence packing for target (only if labels are present)
-        if item["labels"] is not None:
-            tgt_tokens.extend(item["labels"])
-            tgt_lens.append(len(item["labels"]))
-            
+    # 2. Padding Target Sequences (tgt)
+    if all(item["labels"] is not None for item in batch):
+        tgt_tensors = [torch.tensor(item["labels"], dtype=torch.long) for item in batch]
+        tgt_padded = pad_sequence(tgt_tensors, batch_first=True, padding_value=PAD_ID)
+        tgt_lens = torch.tensor([len(s) for s in tgt_tensors], dtype=torch.int32)
+    else:
+        # 預測模式 (prediction mode)
+        tgt_padded = torch.empty((len(batch), 0), dtype=torch.long) 
+        tgt_lens = torch.empty(len(batch), dtype=torch.int32)
+
     return {
-        "src": torch.tensor(src_tokens, dtype=torch.long),
-        "tgt": torch.tensor(tgt_tokens, dtype=torch.long),
-        "src_len": torch.tensor(src_lens, dtype=torch.int32),
-        "tgt_len": torch.tensor(tgt_lens, dtype=torch.int32),
+        "src": src_padded, # (B, L_src)
+        "tgt": tgt_padded, # (B, L_tgt)
+        "src_len": src_lens, 
+        "tgt_len": tgt_lens,
         "id": id_s,
     }
 

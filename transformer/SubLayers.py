@@ -34,29 +34,34 @@ class MultiHeadAttention(nn.Module):
 
         residual = q
 
-        # Pass through the pre-attention projection: b x lq x (n*dv)
-        # Separate different heads: b x lq x n x dv
-        q = self.w_qs(q).view(sz_b, len_q, n_head, d_k)
-        k = self.w_ks(k).view(sz_b, len_k, n_head, d_k)
-        v = self.w_vs(v).view(sz_b, len_v, n_head, d_v)
-
-        # Transpose for attention dot product: b x n x lq x dv
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-
+        # 1. 投影並重塑
+        q = self.w_qs(q).view(sz_b, len_q, n_head, d_k).transpose(1, 2)
+        k = self.w_ks(k).view(sz_b, len_k, n_head, d_k).transpose(1, 2)
+        v = self.w_vs(v).view(sz_b, len_v, n_head, d_v).transpose(1, 2)
+        
+        # 2. 準備遮罩
         if mask is not None:
-            mask = mask.unsqueeze(1)   # For head axis broadcasting.
+            mask = mask.unsqueeze(1) 
 
-        q, attn = self.attention(q, k, v, mask=mask)
+        # 3. Scaled Dot-Product Attention
+        q = q.contiguous().view(-1, len_q, d_k) 
+        k = k.contiguous().view(-1, len_k, d_k)
+        v = v.contiguous().view(-1, len_v, d_v)
+        
+        if mask is not None:
+             mask = mask.repeat(n_head, 1, 1)
 
-        # Transpose to move the head dimension back: b x lq x n x dv
-        # Combine the last two dimensions to concatenate all the heads together: b x lq x (n*dv)
-        q = q.transpose(1, 2).contiguous().view(sz_b, len_q, -1)
-        q = self.dropout(self.fc(q))
-        q += residual
+        output, attn = self.attention(q, k, v, mask=mask)
 
-        q = self.layer_norm(q)
+        # 4. 組合頭並輸出
+        output = output.view(sz_b, n_head, len_q, d_v).transpose(1, 2).contiguous()
+        output = output.view(sz_b, len_q, -1)
 
-        return q, attn
+        output = self.dropout(self.fc(output))
+        output += residual
+        output = self.layer_norm(output)
+
+        return output, attn
 
 
 class PositionwiseFeedForward(nn.Module):
