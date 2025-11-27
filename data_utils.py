@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import csv
 import torch
-from transformer.Const import *
+from transformer.Constants import *
 from torch.utils.data import Dataset
 from datasets import load_dataset
 from transformers import PreTrainedTokenizerBase
