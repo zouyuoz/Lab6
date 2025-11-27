@@ -14,7 +14,8 @@ import torch.nn.functional as F
 def get_pad_mask(seq, pad_idx):
     # 遮罩的值為 True 的地方會被遮蔽 (設為 -inf)
     # 遮罩 shape: (B, 1, L)
-    return (seq != pad_idx).unsqueeze(-2) 
+    # return (seq != pad_idx).unsqueeze(-2) 
+    return (seq == pad_idx).unsqueeze(-2) # True marks positions to be masked
 
 def get_subsequent_mask(seq):
     ''' For masking out the subsequent info. '''
