@@ -8,6 +8,7 @@ from transformers import ModernBertModel, AutoTokenizer
 from transformer.Layers import DecoderLayer 
 from transformer.Constants import *
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 
 # --- MASKING & UTILITIES (來自 jadore801120) ---
 
@@ -181,23 +182,143 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             logits[logits < kth_value] = filter_value
             
         if 0.0 < top_p < 1.0:
+            # 確保 logits 上的排序和 Softmax 數值穩定
+            
+            # 1. Sort logits and calculate softmax
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
             probabilities = torch.softmax(sorted_logits, dim=-1)
+            
+            # 2. Calculate cumulative probabilities
             cumulative_probabilities = torch.cumsum(probabilities, dim=-1)
+
+            # 3. Find the tokens to remove
             sorted_indices_to_remove = cumulative_probabilities > top_p
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
             sorted_indices_to_remove[..., 0] = False
-            logits.scatter_(dim=-1, index=sorted_indices, src=filter_value * sorted_indices_to_remove)
             
+            # 4. 遮蔽 logits
+            filter_value: float = -1e10 # <--- 修正: 使用一個較小的負數，避免使用 -float('Inf')
+            src_mask = sorted_indices_to_remove.type_as(logits)
+            
+            # 替換遮蔽位置的 Logits
+            logits.scatter_(dim=-1, index=sorted_indices, src=filter_value * src_mask)
+            
+            # --- 新增數值穩定性檢查 ---
+            # 確保 softmax 之前至少有一個 token 權重非負無窮
+            # 這裡我們利用了 Top-K 的邏輯: 如果 top-p 遮蔽了所有 token，
+            # 至少保留 Top-1 token，避免 Softmax 輸出 NaN。
+            if torch.all(logits == -float('Inf')):
+                 logits[:, sorted_indices[:, 0]] = 0.0 # 至少保留分數最高的 token
+
         return logits
 
     # generate 邏輯必須完全重寫以支持 Padding/Masking，但為了簡潔，我們只替換核心邏輯
-    def generate(self, input_ids, src_seq_len, generation_limit, sampling=False, top_k=10, top_p=0.9):
-        # ******************************************************************
-        # WARNING: This implementation is for demonstration. 
-        # The full generate logic for Padding/Masking is complex and long.
-        # ******************************************************************
-        raise NotImplementedError("Generation for padding model requires full rewrite.")
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor, # 這裡是 src_input_ids
+        src_seq_len: torch.Tensor, # 這裡的 src_seq_len 不再用於 cu_seqlens，但保留作參數
+        generation_limit: int,
+        sampling: bool = False,
+        top_k: int = 10,
+        top_p: float = 0.9,
+    ) -> List[str]:
+        self.eval()
+        device = self.output_projection.weight.device
+        bsz = input_ids.size(0)
+        
+        # 1. Encoder 步驟 (只需執行一次)
+        # BERT 輸出: last_hidden_state (batch_size, len_s, d_model)
+        src_mask = (input_ids != self.pad_idx).long() # BERT 自己的 mask
+        enc_output = self.encoder(
+            input_ids, 
+            attention_mask=src_mask
+        ).last_hidden_state
+        
+        # 創建 Encoder-Decoder Attention Mask (用於遮蔽 Padding)
+        # 遮罩 shape: (B, 1, Ls) -> (B, Ls) 傳給 get_pad_mask
+        enc_dec_mask = get_pad_mask(input_ids, self.pad_idx)
+        
+        # 2. 初始化 Decoder Sequences
+        bos_id = self.tokenizer.cls_token_id
+        sep_id = self.tokenizer.sep_token_id
+        
+        # sequences: 儲存當前已生成的序列 (BOS token)
+        sequences: List[torch.Tensor] = [
+            torch.tensor([bos_id], dtype=torch.long, device=device) for _ in range(bsz)
+        ]
+        # finished: 標記哪些序列已生成 EOS
+        finished = torch.zeros(bsz, dtype=torch.bool, device=device)
+
+        # 3. Auto-regressive Decoding Loop
+        for _ in range(generation_limit):
+            # 將所有序列堆疊成一個大 tensor (L_max, B) -> (B, L_max)
+            # trg_input_ids shape: (B, current_max_len)
+            max_len = max(s.size(0) for s in sequences)
+            
+            # 使用 PAD 補齊所有序列到當前最長長度
+            trg_input_ids = pad_sequence(sequences, batch_first=True, padding_value=self.pad_idx).to(device)
+
+            # 創建 Causal Mask 和 Padding Mask
+            trg_pad_mask = get_pad_mask(trg_input_ids, self.pad_idx) # (B, 1, Lt)
+            trg_causal_mask = get_subsequent_mask(trg_input_ids) # (1, Lt, Lt)
+
+            # 合併兩個遮罩：任何為 True 的位置都將被遮蔽
+            # 這裡的 & 運算在布林張量上是交集，確保同時滿足因果和 Padding 條件
+            # (B, 1, Lt) | (1, Lt, Lt) -> (B, Lt, Lt)
+            trg_mask = trg_pad_mask | trg_causal_mask
+
+            # 4. 模型 Inference
+            # src_mask = enc_dec_mask (Encoder的Padding Mask)
+            logits = self.forward(
+                src_input_ids=input_ids,
+                trg_input_ids=trg_input_ids,
+                src_mask=enc_dec_mask,
+                trg_mask=trg_mask
+            )
+            
+            # 5. 獲取下一個 token 的 logits
+            # 獲取每個序列的最後一個位置的 logits (B, 1, Vocab_size)
+            next_token_logits = logits[torch.arange(bsz), [len(s) - 1 for s in sequences]]
+            
+            # 6. 處理已完成的序列
+            if finished.any():
+                # 將已完成序列的 logits 設為 -inf，只留下 PAD token 的 logits
+                next_token_logits[finished] = -float("inf")
+                next_token_logits[finished, self.tokenizer.pad_token_id] = 0.0
+
+            # 7. 選擇下一個 Token (Sampling 或 Greedy)
+            if sampling:
+                filtered_logits = self.top_k_top_p_filtering(
+                    next_token_logits, top_k=top_k, top_p=top_p
+                )
+                probabilities = torch.softmax(filtered_logits, dim=-1)
+                next_token = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
+            else:
+                next_token = torch.argmax(next_token_logits, dim=-1)
+
+            # 8. 更新序列和完成標記
+            for idx in range(bsz):
+                if finished[idx]:
+                    continue
+                
+                sequences[idx] = torch.cat([sequences[idx], next_token[idx].view(1)])
+                
+                if next_token[idx].item() == sep_id:
+                    finished[idx] = True
+
+            if bool(torch.all(finished)):
+                break
+        
+        # 9. 解碼最終輸出
+        output_text: List[str] = []
+        for seq in sequences:
+            tokens = seq.tolist()
+            if sep_id in tokens:
+                tokens = tokens[: tokens.index(sep_id)]
+            output_text.append(self.tokenizer.decode(tokens, skip_special_tokens=True))
+            
+        return output_text
         
     def _cast_modules_to_dtype(self, dtype: Optional[torch.dtype]) -> None:
         if dtype is None:
