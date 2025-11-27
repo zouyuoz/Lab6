@@ -216,8 +216,8 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
     @torch.no_grad()
     def generate(
         self,
-        input_ids: torch.Tensor, # 這裡是 src_input_ids
-        src_seq_len: torch.Tensor, # 這裡的 src_seq_len 不再用於 cu_seqlens，但保留作參數
+        input_ids: torch.Tensor,
+        src_seq_len: torch.Tensor,
         generation_limit: int,
         sampling: bool = False,
         top_k: int = 10,
@@ -227,67 +227,76 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
         device = self.output_projection.weight.device
         bsz = input_ids.size(0)
         
-        # 1. Encoder 步驟 (只需執行一次)
-        # BERT 輸出: last_hidden_state (batch_size, len_s, d_model)
-        src_mask = (input_ids != self.pad_idx).long() # BERT 自己的 mask
+        # 1. Encoder 步驟 (只需執行一次，大幅加速)
+        # 建立 Source Mask (True = Keep, False = Pad)
+        src_mask = (input_ids != self.pad_idx).unsqueeze(1).to(device) # (B, 1, Ls)
+        
+        # 執行 Encoder
         enc_output = self.encoder(
             input_ids, 
-            attention_mask=src_mask
+            attention_mask=(input_ids != self.pad_idx).long()
         ).last_hidden_state
         
-        # 創建 Encoder-Decoder Attention Mask (用於遮蔽 Padding)
-        # 遮罩 shape: (B, 1, Ls) -> (B, Ls) 傳給 get_pad_mask
-        enc_dec_mask = get_pad_mask(input_ids, self.pad_idx)
-        
         # 2. 初始化 Decoder Sequences
-        bos_id = self.tokenizer.cls_token_id
+        # 嘗試取得 BOS Token
+        bos_id = self.tokenizer.bos_token_id
+        if bos_id is None:
+             # 如果沒有 BOS，使用 CLS 或 SEP (視你的 Tokenizer 而定，這裡預設用 CLS)
+             bos_id = self.tokenizer.cls_token_id 
         sep_id = self.tokenizer.sep_token_id
-        
-        # sequences: 儲存當前已生成的序列 (BOS token)
+        if sep_id is None:
+             sep_id = self.tokenizer.eos_token_id
+
+        # sequences: 儲存當前已生成的序列 [BOS]
         sequences: List[torch.Tensor] = [
             torch.tensor([bos_id], dtype=torch.long, device=device) for _ in range(bsz)
         ]
+        
         # finished: 標記哪些序列已生成 EOS
         finished = torch.zeros(bsz, dtype=torch.bool, device=device)
 
         # 3. Auto-regressive Decoding Loop
         for _ in range(generation_limit):
-            # 將所有序列堆疊成一個大 tensor (L_max, B) -> (B, L_max)
-            # trg_input_ids shape: (B, current_max_len)
-            max_len = max(s.size(0) for s in sequences)
-            
-            # 使用 PAD 補齊所有序列到當前最長長度
+            # 準備 Target Input
+            # (注意：這裡為了簡單與正確性，每個 step 重組 batch，效能影響遠小於 Encoder 重算)
             trg_input_ids = pad_sequence(sequences, batch_first=True, padding_value=self.pad_idx).to(device)
 
-            # 創建 Causal Mask 和 Padding Mask
-            trg_pad_mask = get_pad_mask(trg_input_ids, self.pad_idx) # (B, 1, Lt)
-            trg_causal_mask = get_subsequent_mask(trg_input_ids) # (1, Lt, Lt)
-
-            # 合併兩個遮罩：任何為 True 的位置都將被遮蔽
-            # 這裡的 & 運算在布林張量上是交集，確保同時滿足因果和 Padding 條件
-            # (B, 1, Lt) | (1, Lt, Lt) -> (B, Lt, Lt)
-            trg_mask = trg_pad_mask | trg_causal_mask
-
-            # 4. 模型 Inference
-            # src_mask = enc_dec_mask (Encoder的Padding Mask)
-            logits = self.forward(
-                src_input_ids=input_ids,
-                trg_input_ids=trg_input_ids,
-                src_mask=enc_dec_mask,
+            # --- Mask 修正 (True = Keep) ---
+            # Pad Mask: (B, 1, Lt) - 不是 Pad 的地方是 True
+            trg_pad_mask = (trg_input_ids != self.pad_idx).unsqueeze(1).to(device)
+            
+            # Causal Mask: (1, Lt, Lt) - 下三角為 True
+            Lt = trg_input_ids.size(1)
+            trg_causal_mask = torch.tril(torch.ones((Lt, Lt), device=device, dtype=torch.bool)).unsqueeze(0)
+            
+            # 合併 Mask (使用 & 取交集)
+            trg_mask = trg_pad_mask & trg_causal_mask
+            
+            # --- 修正重點：直接呼叫 decoder，傳入算好的 enc_output ---
+            dec_output = self.decoder(
+                trg_input_ids, 
+                enc_output,       # 重複使用，不重算
+                src_mask=src_mask,
                 trg_mask=trg_mask
             )
             
-            # 5. 獲取下一個 token 的 logits
-            # 獲取每個序列的最後一個位置的 logits (B, 1, Vocab_size)
-            next_token_logits = logits[torch.arange(bsz), [len(s) - 1 for s in sequences]]
+            # 取得最後一個 step 的 logits
+            # dec_output: (B, Lt, D)
+            # 我們只需要每個序列當前長度的最後一個 token
+            last_token_indices = torch.tensor([len(s) - 1 for s in sequences], device=device)
+            # 這裡簡單取 batch 的對角線元素或者 gather
+            # 為了簡單，直接取最後一列 (因為 pad_sequence 會把短的補在後面，取真實長度位置比較安全)
+            # 但因為 Transformer 架構特性，我們可以簡單地取 trg_input_ids 的最後一個有效位置
+            # 這裡用 gather 比較保險：
+            last_hidden = dec_output[torch.arange(bsz, device=device), last_token_indices]
+            next_token_logits = self.output_projection(last_hidden) # (B, Vocab)
             
-            # 6. 處理已完成的序列
+            # 4. 處理已完成的序列
             if finished.any():
-                # 將已完成序列的 logits 設為 -inf，只留下 PAD token 的 logits
                 next_token_logits[finished] = -float("inf")
                 next_token_logits[finished, self.tokenizer.pad_token_id] = 0.0
 
-            # 7. 選擇下一個 Token (Sampling 或 Greedy)
+            # 5. 選擇下一個 Token
             if sampling:
                 filtered_logits = self.top_k_top_p_filtering(
                     next_token_logits, top_k=top_k, top_p=top_p
@@ -297,26 +306,42 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             else:
                 next_token = torch.argmax(next_token_logits, dim=-1)
 
-            # 8. 更新序列和完成標記
+            # 6. 更新序列
+            all_done = True
             for idx in range(bsz):
-                if finished[idx]:
-                    continue
-                
-                sequences[idx] = torch.cat([sequences[idx], next_token[idx].view(1)])
-                
-                if next_token[idx].item() == sep_id:
-                    finished[idx] = True
-
-            if bool(torch.all(finished)):
+                if not finished[idx]:
+                    token_id = next_token[idx].item()
+                    sequences[idx] = torch.cat([sequences[idx], next_token[idx].view(1)])
+                    
+                    if token_id == sep_id or token_id == self.tokenizer.eos_token_id:
+                        finished[idx] = True
+                    else:
+                        all_done = False
+            
+            if all_done:
                 break
         
-        # 9. 解碼最終輸出
+        # 7. 解碼最終輸出
         output_text: List[str] = []
         for seq in sequences:
+            # 移除 BOS 和 EOS/SEP
             tokens = seq.tolist()
-            if sep_id in tokens:
-                tokens = tokens[: tokens.index(sep_id)]
-            output_text.append(self.tokenizer.decode(tokens, skip_special_tokens=True))
+            # 簡單清理：從第一個不是 BOS 的開始，到第一個 SEP/EOS 結束
+            cut_tokens = []
+            start_collecting = False
+            for t in tokens:
+                if t == bos_id: # 跳過開頭的 BOS
+                    start_collecting = True
+                    continue
+                if t == sep_id or t == self.tokenizer.eos_token_id:
+                    break
+                cut_tokens.append(t)
+            
+            # 如果沒有 BOS (例如被 pad_sequence 弄亂)，就直接 decode 全補
+            if not cut_tokens and len(tokens) > 1:
+                 cut_tokens = tokens
+
+            output_text.append(self.tokenizer.decode(cut_tokens, skip_special_tokens=True))
             
         return output_text
         
