@@ -48,8 +48,13 @@ class MultiHeadAttention(nn.Module):
         k = k.contiguous().view(-1, len_k, d_k)
         v = v.contiguous().view(-1, len_v, d_v)
         
+        # --- 修改開始 ---
         if mask is not None:
-             mask = mask.repeat(n_head, 1, 1)
+             # 原本錯誤：mask = mask.repeat(n_head, 1, 1)
+             # 修正：先在 Head 維度擴展，再展平以匹配 q, k, v 的 (Batch*Head) 維度
+             mask = mask.repeat(1, n_head, 1, 1)
+             mask = mask.view(-1, mask.size(-2), mask.size(-1))
+        # --- 修改結束 ---
 
         output, attn = self.attention(q, k, v, mask=mask)
 
