@@ -1,3 +1,8 @@
+PAD_WORD = '<blank>'
+UNK_WORD = '<unk>'
+BOS_WORD = '<s>'
+EOS_WORD = '</s>'
+
 # reference link:https://huggingface.co/answerdotai/ModernBERT-base/blob/main/special_tokens_map.json
 SOS = "[CLS]"
 EOS = "[SEP]"

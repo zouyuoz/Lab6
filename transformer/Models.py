@@ -1,12 +1,25 @@
 ''' Define the Transformer model '''
-from multiprocessing import context
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import List, Optional
-from transformer.Layers import DecoderLayer_Flash
-from transformer.utils import *
-from transformer.Const import *
+from transformer.Layers import EncoderLayer, DecoderLayer
+
+
+__author__ = "Yu-Hsiang Huang"
+
+
+def get_pad_mask(seq, pad_idx):
+    return (seq != pad_idx).unsqueeze(-2)
+
+
+def get_subsequent_mask(seq):
+    ''' For masking out the subsequent info. '''
+    sz_b, len_s = seq.size()
+    subsequent_mask = (1 - torch.triu(
+        torch.ones((1, len_s, len_s), device=seq.device), diagonal=1)).bool()
+    return subsequent_mask
+
+
 class PositionalEncoding(nn.Module):
 
     def __init__(self, d_hid, n_position=200):
@@ -28,305 +41,158 @@ class PositionalEncoding(nn.Module):
 
         return torch.FloatTensor(sinusoid_table).unsqueeze(0)
 
-    def forward(self, x, seq_lens=None):
-        if seq_lens is None:
-            return x + self.pos_table[:, :x.size(1)].clone().detach()
+    def forward(self, x):
+        return x + self.pos_table[:, :x.size(1)].clone().detach()
 
-        seq_lens = seq_lens.to(device=x.device, dtype=torch.long)
-        total_seq_len = int(seq_lens.sum().item())
-        if total_seq_len != x.size(0):
-            raise ValueError(
-                f"Packed sequence length mismatch: got {x.size(0)} tokens, "
-                f"but seq_lens sum to {total_seq_len}."
-            )
 
-        seq_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
-        token_seq_ids = torch.arange(seq_lens.size(0), device=x.device).repeat_interleave(seq_lens)
-        seq_offsets = seq_starts[token_seq_ids]
-        position_ids = torch.arange(total_seq_len, device=x.device) - seq_offsets
+class Encoder(nn.Module):
+    ''' A encoder model with self attention mechanism. '''
 
-        max_pos = int(position_ids.max().item())
-        if max_pos >= self.pos_table.size(1):
-            raise ValueError(
-                f"Requested position {max_pos} exceeds available sinusoid size {self.pos_table.size(1)}."
-            )
+    def __init__(
+            self, n_src_vocab, d_word_vec, n_layers, n_head, d_k, d_v,
+            d_model, d_inner, pad_idx, dropout=0.1, n_position=200, scale_emb=False):
 
-        pos_emb = self.pos_table[:, position_ids, :].squeeze(0)
-        return x + pos_emb
-    
+        super().__init__()
+
+        self.src_word_emb = nn.Embedding(n_src_vocab, d_word_vec, padding_idx=pad_idx)
+        self.position_enc = PositionalEncoding(d_word_vec, n_position=n_position)
+        self.dropout = nn.Dropout(p=dropout)
+        self.layer_stack = nn.ModuleList([
+            EncoderLayer(d_model, d_inner, n_head, d_k, d_v, dropout=dropout)
+            for _ in range(n_layers)])
+        self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
+        self.scale_emb = scale_emb
+        self.d_model = d_model
+
+    def forward(self, src_seq, src_mask, return_attns=False):
+
+        enc_slf_attn_list = []
+
+        # -- Forward
+        enc_output = self.src_word_emb(src_seq)
+        if self.scale_emb:
+            enc_output *= self.d_model ** 0.5
+        enc_output = self.dropout(self.position_enc(enc_output))
+        enc_output = self.layer_norm(enc_output)
+
+        for enc_layer in self.layer_stack:
+            enc_output, enc_slf_attn = enc_layer(enc_output, slf_attn_mask=src_mask)
+            enc_slf_attn_list += [enc_slf_attn] if return_attns else []
+
+        if return_attns:
+            return enc_output, enc_slf_attn_list
+        return enc_output,
+
+
 class Decoder(nn.Module):
     ''' A decoder model with self attention mechanism. '''
 
     def __init__(
             self, n_trg_vocab, d_word_vec, n_layers, n_head, d_k, d_v,
-            d_model, d_inner, pad_idx, n_position=200, dropout=0.1, flash_attn=True):
+            d_model, d_inner, pad_idx, n_position=200, dropout=0.1, scale_emb=False):
 
         super().__init__()
 
         self.trg_word_emb = nn.Embedding(n_trg_vocab, d_word_vec, padding_idx=pad_idx)
-        self.position_enc = PositionalEncoding(d_model, n_position=n_position)
+        self.position_enc = PositionalEncoding(d_word_vec, n_position=n_position)
         self.dropout = nn.Dropout(p=dropout)
-        self.flash_attn = flash_attn
-        
-        d_qkv = d_k
         self.layer_stack = nn.ModuleList([
-            DecoderLayer_Flash(
-                d_model, d_inner, n_head, d_qkv, dropout=dropout
-            )
-            for _ in range(n_layers)
-        ])
+            DecoderLayer(d_model, d_inner, n_head, d_k, d_v, dropout=dropout)
+            for _ in range(n_layers)])
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
+        self.scale_emb = scale_emb
         self.d_model = d_model
 
-    def forward(self, trg_seq, trg_mask, enc_output, src_mask):
-        ######### YOUR CODE STARTS HERE #########
-        # HINTS:
-        # 1. IF flash_attn is True, trg_mask and src_mask are SEQ_LEN tensors.
-        # 2. Process will be embedding -> positional encoding -> dropout -> decoder layers -> layer norm
-        #########################################
-        trg_seq_lens = trg_mask
-        enc_seq_lens = src_mask
+    def forward(self, trg_seq, trg_mask, enc_output, src_mask, return_attns=False):
 
-        # 1. Embedding
+        dec_slf_attn_list, dec_enc_attn_list = [], []
+
+        # -- Forward
         dec_output = self.trg_word_emb(trg_seq)
-        
-        # 2. Positional Encoding
-        dec_output = self.position_enc(dec_output, seq_lens=trg_seq_lens)
-        
-        # 3. Dropout
-        dec_output = self.dropout(dec_output)
-
-        # 4. Decoder Layers
-        for layer in self.layer_stack:
-            dec_output = layer(
-                dec_output,
-                trg_seq_lens,
-                enc_output,
-                enc_seq_lens,
-            )
-            
-        # 5. Layer Norm
+        if self.scale_emb:
+            dec_output *= self.d_model ** 0.5
+        dec_output = self.dropout(self.position_enc(dec_output))
         dec_output = self.layer_norm(dec_output)
-        
-        return dec_output
+
+        for dec_layer in self.layer_stack:
+            dec_output, dec_slf_attn, dec_enc_attn = dec_layer(
+                dec_output, enc_output, slf_attn_mask=trg_mask, dec_enc_attn_mask=src_mask)
+            dec_slf_attn_list += [dec_slf_attn] if return_attns else []
+            dec_enc_attn_list += [dec_enc_attn] if return_attns else []
+
+        if return_attns:
+            return dec_output, dec_slf_attn_list, dec_enc_attn_list
+        return dec_output,
 
 
-from transformers import ModernBertModel, AutoTokenizer
-from transformer.Const import *
+class Transformer(nn.Module):
+    ''' A sequence to sequence model with attention mechanism. '''
 
-class Seq2SeqModelWithFlashAttn(nn.Module):
     def __init__(
-        self,
-        transformer_model_path: str = "answerdotai/ModernBERT-base",
-        freeze_encoder: bool = True,
-        weight_dtype: Optional[torch.dtype] = torch.bfloat16,
-    ):
+            self, n_src_vocab, n_trg_vocab, src_pad_idx, trg_pad_idx,
+            d_word_vec=512, d_model=512, d_inner=2048,
+            n_layers=6, n_head=8, d_k=64, d_v=64, dropout=0.1, n_position=200,
+            trg_emb_prj_weight_sharing=True, emb_src_trg_weight_sharing=True,
+            scale_emb_or_prj='prj'):
+
         super().__init__()
-        encoder_kwargs = {}
-        if weight_dtype is not None:
-            encoder_kwargs["torch_dtype"] = weight_dtype
-        self.encoder = ModernBertModel.from_pretrained(transformer_model_path, **encoder_kwargs)
-        self.tokenizer = AutoTokenizer.from_pretrained(transformer_model_path)
+
+        self.src_pad_idx, self.trg_pad_idx = src_pad_idx, trg_pad_idx
+
+        # In section 3.4 of paper "Attention Is All You Need", there is such detail:
+        # "In our model, we share the same weight matrix between the two
+        # embedding layers and the pre-softmax linear transformation...
+        # In the embedding layers, we multiply those weights by \sqrt{d_model}".
+        #
+        # Options here:
+        #   'emb': multiply \sqrt{d_model} to embedding output
+        #   'prj': multiply (\sqrt{d_model} ^ -1) to linear projection output
+        #   'none': no multiplication
+
+        assert scale_emb_or_prj in ['emb', 'prj', 'none']
+        scale_emb = (scale_emb_or_prj == 'emb') if trg_emb_prj_weight_sharing else False
+        self.scale_prj = (scale_emb_or_prj == 'prj') if trg_emb_prj_weight_sharing else False
+        self.d_model = d_model
+
+        self.encoder = Encoder(
+            n_src_vocab=n_src_vocab, n_position=n_position,
+            d_word_vec=d_word_vec, d_model=d_model, d_inner=d_inner,
+            n_layers=n_layers, n_head=n_head, d_k=d_k, d_v=d_v,
+            pad_idx=src_pad_idx, dropout=dropout, scale_emb=scale_emb)
+
         self.decoder = Decoder(
-            n_trg_vocab=len(self.tokenizer),
-            d_word_vec=768,
-            n_layers=12,
-            n_head=12,
-            d_k=768 // 12,
-            d_v=768 // 12,
-            d_model=768,
-            d_inner=768 * 2,
-            pad_idx=self.tokenizer.pad_token_id,
-            n_position=MAX_TARGET_LEN,
-            dropout=0.1,
-            flash_attn=True)
-        self.output_projection = nn.Linear(768, len(self.tokenizer), bias=False)
-        self._cast_modules_to_dtype(weight_dtype)
-        self._tie_decoder_embeddings()
-        if freeze_encoder:
-            for param in self.encoder.parameters():
-                param.requires_grad = False
-        self.weight_dtype = weight_dtype
-    def forward(self, src_input_ids, trg_input_ids, src_seq_len, trg_seq_len):
-        # src_input and trg_input are assumed to be already tokenized and sequence packed.
-        # src_input and trg_input shape should be (total_seq_len, )
-        # Encode
-        dummy_mask = torch.tensor(1, device=src_input_ids.device)
-        bsz = src_seq_len.size(0)
-        src_cu_seqlens = seqlen2cu_len(src_seq_len)
-        max_src_len = src_seq_len.max().item()
-        enc_outputs = self.encoder(
-            input_ids=src_input_ids,
-            attention_mask=dummy_mask,
-            cu_seqlens=src_cu_seqlens,
-            max_seqlen=max_src_len,
-            batch_size=bsz
-        )
-        enc_output = enc_outputs["last_hidden_state"] # shape: (total_src_seq_len, d_model)
-        assert enc_output.size(0) == src_input_ids.size(0), (enc_output.size(), src_input_ids.size())
-        dec_output = self.decoder(
-            trg_seq=trg_input_ids,
-            trg_mask=trg_seq_len,
-            enc_output=enc_output,
-            src_mask=src_seq_len
-        )
-        # Project to vocabulary
-        logits = self.output_projection(dec_output)
-        return logits
-    
-    def top_k_top_p_filtering(
-        self,
-        logits: torch.Tensor,
-        top_k,
-        top_p
-    ) -> torch.Tensor:
-        # logits: (bsz, vocab_size)
-        if logits.dim() == 1:
-            logits = logits.unsqueeze(0)
-        filter_value: float = -float('Inf')
-        vocab_size = logits.size(-1)
-        if top_k > 0 and top_k < vocab_size:
-            ############# YOUR CODE STARTS HERE #############
-            # HINT:
-            # USE torch.topk TO GET THE TOP-K LOGITS AND SET OTHERS TO filter_value
-            v, _ = torch.topk(logits, top_k)
-            kth_value = v[:, -1].unsqueeze(-1)
-            logits[logits < kth_value] = filter_value
-            ###############################################
-            
-        
-        if 0.0 < top_p < 1.0:
-            ############# YOUR CODE STARTS HERE #############
-            # HINTS:
-            # 1. USE torch.sort TO SORT THE LOGITS
-            # 2. CALCULATE SOFTMAX PROBABILITIES UNDER FILTERED LOGITS
-            # 3. CALCULATE CUMULATIVE PROBABILITIES
-            # 4. SET LOGITS WITH CUMULATIVE PROBABILITIES > top_p TO filter_value
-            
-            # 1. Sort logits
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            
-            # 2. Calculate softmax probabilities
-            probabilities = torch.softmax(sorted_logits, dim=-1)
-            
-            # 3. Calculate cumulative probabilities
-            cumulative_probabilities = torch.cumsum(probabilities, dim=-1)
+            n_trg_vocab=n_trg_vocab, n_position=n_position,
+            d_word_vec=d_word_vec, d_model=d_model, d_inner=d_inner,
+            n_layers=n_layers, n_head=n_head, d_k=d_k, d_v=d_v,
+            pad_idx=trg_pad_idx, dropout=dropout, scale_emb=scale_emb)
 
-            # 4. Find the tokens to remove
-            # Shift the mask to the right to keep the last token that is still below top_p
-            sorted_indices_to_remove = cumulative_probabilities > top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = False
-            
-            # Set the logits to filter_value
-            logits.scatter_(dim=-1, index=sorted_indices, src=filter_value * sorted_indices_to_remove)
-            ###############################################
-        return logits # YOU NEED TO RETURN THE FILTERED RAW LOGITS, NOT PROBABILITIES
+        self.trg_word_prj = nn.Linear(d_model, n_trg_vocab, bias=False)
 
-    def generate(
-        self,
-        input_ids: torch.Tensor,
-        src_seq_len: torch.Tensor,
-        generation_limit: int,
-        sampling: bool = False,
-        top_k: int = 10,
-        top_p: float = 0.9,
-    ) -> List[str]:
-        device = self.output_projection.weight.device
-        src_seq_len = src_seq_len.to(device=device, dtype=torch.int32)
-        bsz = src_seq_len.size(0)
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p) 
 
-        # 1. Encoder Step (Missing in your upload)
-        dummy_mask = torch.tensor(1, device=device)
-        src_cu_seqlens = seqlen2cu_len(src_seq_len)
-        max_src_len = src_seq_len.max().item()
-        enc_outputs = self.encoder(
-            input_ids=input_ids,
-            attention_mask=dummy_mask,
-            cu_seqlens=src_cu_seqlens,
-            max_seqlen=max_src_len,
-            batch_size=bsz
-        )
-        enc_output = enc_outputs["last_hidden_state"] # shape: (total_src_seq_len, d_model)
-        
-        # 2. Initialization (Missing in your upload)
-        bos_id = self.tokenizer.cls_token_id # Use CLS_ID as BOS based on Const.py
-        # Store sequences as tensors for efficiency
-        sequences: List[torch.Tensor] = [torch.tensor([bos_id], dtype=torch.long, device=device) for _ in range(bsz)]
-        finished = torch.zeros(bsz, dtype=torch.bool, device=device)
+        assert d_model == d_word_vec, \
+        'To facilitate the residual connections, \
+         the dimensions of all module outputs shall be the same.'
 
-        for _ in range(generation_limit):
-            ############### YOUR CODE STARTS HERE #############
-            # 1. PREPARE trg_input_ids AND trg_seq_len FROM sequences
-            trg_input_ids = torch.cat(sequences)
-            trg_seq_len = torch.tensor([s.size(0) for s in sequences], dtype=torch.int32, device=device)
+        if trg_emb_prj_weight_sharing:
+            # Share the weight between target word embedding & last dense layer
+            self.trg_word_prj.weight = self.decoder.trg_word_emb.weight
 
-            # 2. CALL THE DECODER AND OUTPUT PROJECTION TO GET next_token_logits
-            dec_output = self.decoder(
-                trg_seq=trg_input_ids,
-                trg_mask=trg_seq_len,
-                enc_output=enc_output,
-                src_mask=src_seq_len
-            )
-            
-            # Project to vocabulary
-            logits = self.output_projection(dec_output) # (total_trg_tokens, vocab_size)
+        if emb_src_trg_weight_sharing:
+            self.encoder.src_word_emb.weight = self.decoder.trg_word_emb.weight
 
-            # Get the logit for the next token (the logit of the last token in each sequence)
-            cu_seqlens_no_pad = torch.cumsum(trg_seq_len, dim=0, dtype=torch.long)
-            last_token_indices = cu_seqlens_no_pad - 1 
-            
-            next_token_logits = logits[last_token_indices]
-            ###################################################
 
-            if finished.any():
-                next_token_logits[finished] = -float("inf")
-                next_token_logits[
-                    finished, self.tokenizer.pad_token_id
-                ] = 0.0  # keep PAD sticky
+    def forward(self, src_seq, trg_seq):
 
-            if sampling:
-                filtered_logits = self.top_k_top_p_filtering(
-                    next_token_logits,
-                    top_k=top_k,
-                    top_p=top_p,
-                )
-                probabilities = torch.softmax(filtered_logits, dim=-1)
-                next_token = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
-            else:
-                next_token = torch.argmax(next_token_logits, dim=-1)
+        src_mask = get_pad_mask(src_seq, self.src_pad_idx)
+        trg_mask = get_pad_mask(trg_seq, self.trg_pad_idx) & get_subsequent_mask(trg_seq)
 
-            for idx in range(bsz):
-                if finished[idx]:
-                    continue
-                sequences[idx] = torch.cat(
-                    [sequences[idx], next_token[idx].view(1)]
-                )
-                if next_token[idx].item() == self.tokenizer.sep_token_id:
-                    finished[idx] = True
+        enc_output, *_ = self.encoder(src_seq, src_mask)
+        dec_output, *_ = self.decoder(trg_seq, trg_mask, enc_output, src_mask)
+        seq_logit = self.trg_word_prj(dec_output)
+        if self.scale_prj:
+            seq_logit *= self.d_model ** -0.5
 
-            if bool(torch.all(finished)):
-                break
-
-        output_text: List[str] = []
-        for seq in sequences:
-            tokens = seq.tolist()
-            if self.tokenizer.sep_token_id in tokens:
-                tokens = tokens[: tokens.index(self.tokenizer.sep_token_id)]
-            output_text.append(self.tokenizer.decode(tokens, skip_special_tokens=True))
-        return output_text
-
-    def _cast_modules_to_dtype(self, dtype: Optional[torch.dtype]) -> None:
-        if dtype is None:
-            return
-        self.encoder.to(dtype=dtype)
-        self.decoder.to(dtype=dtype)
-        self.output_projection.to(dtype=dtype)
-
-    def _tie_decoder_embeddings(self) -> None:
-        # Initialize decoder embeddings with encoder embeddings and decoder embeddings tie to output projection layer
-        with torch.no_grad():
-            self.decoder.trg_word_emb.weight.copy_(
-                self.encoder.embeddings.tok_embeddings.weight
-            )
-        self.output_projection.weight = self.decoder.trg_word_emb.weight
+        return seq_logit.view(-1, seq_logit.size(2))

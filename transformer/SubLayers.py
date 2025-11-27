@@ -2,109 +2,63 @@
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-import torch
-import flash_attn
-from flash_attn import flash_attn_varlen_qkvpacked_func, flash_attn_varlen_func
-from transformer.utils import seqlen2cu_len
-class MultiHeadSelfAttention_Flash(nn.Module):
-    ''' Multi-Head self Attention module with Flash Attention '''
+from transformer.Modules import ScaledDotProductAttention
 
-    def __init__(self, n_head, d_model, d_qkv, dropout=0.1, causal=False):
+__author__ = "Yu-Hsiang Huang"
+
+class MultiHeadAttention(nn.Module):
+    ''' Multi-Head Attention module '''
+
+    def __init__(self, n_head, d_model, d_k, d_v, dropout=0.1):
         super().__init__()
+
         self.n_head = n_head
-        self.d_qkv = d_qkv
-        self.w_qkv = nn.Linear(d_model, 3 * d_model, bias=False) # QKV projection (d_model -> 3 * d_model)
-        self.w_o = nn.Linear(d_model, d_model, bias=False) # Output projection (d_model -> d_model)
-        self.dropout_rate = dropout
-        self.dropout_layer = nn.Dropout(dropout)
+        self.d_k = d_k
+        self.d_v = d_v
+
+        self.w_qs = nn.Linear(d_model, n_head * d_k, bias=False)
+        self.w_ks = nn.Linear(d_model, n_head * d_k, bias=False)
+        self.w_vs = nn.Linear(d_model, n_head * d_v, bias=False)
+        self.fc = nn.Linear(n_head * d_v, d_model, bias=False)
+
+        self.attention = ScaledDotProductAttention(temperature=d_k ** 0.5)
+
+        self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
-        self.causal = causal
-    def forward(self, x, seq_lens):
-        # x should be of shape (total_len, d_model)
-        # seq_lens should be of shape (batch_size,) like (4, 3, 2, 23, 1, ...)
-        drop_rate = self.dropout_rate if self.training else 0.0
-        residual = x
-        ################# YOUR CODE HERE #################
-        # 1. use self.w_qkv to get qkv and reshape to (total_len, 3, n_head, d_qkv)
-        qkv = self.w_qkv(x)
-        qkv_packed = qkv.view(-1, 3, self.n_head, self.d_qkv) 
 
-        # 2. change seq_lens to cu_seqlens by using seqlen2cu_len function
-        cu_seqlens = seqlen2cu_len(seq_lens)
-        
-        # 3. get max_len from seq_lens
-        max_len = seq_lens.max().item()
-        ##################################################
-        
-        output = flash_attn_varlen_qkvpacked_func(qkv_packed, cu_seqlens, max_len, dropout_p=drop_rate, causal=self.causal)
-        output = output.reshape(-1, self.n_head * self.d_qkv)
-        ################# YOUR CODE HERE ###################
-        # 1. use self.w_o to project output back to d_model
-        output = self.w_o(output)
-        
-        # 2. apply dropout, residual connection and layer norm
-        output = self.dropout_layer(output)
-        output += residual
-        output = self.layer_norm(output)
-        ##################################################
-        return output
 
-class MultiHeadCrossAttention_Flash(nn.Module):
-    def __init__(self, n_head, d_model, d_qkv, dropout=0.1, causal=False):
-        super().__init__()
-        self.n_head = n_head
-        self.d_qkv = d_qkv
-        self.w_q = nn.Linear(d_model, d_model, bias=False)
-        self.w_kv = nn.Linear(d_model, 2 * d_model, bias=False)
-        self.w_o = nn.Linear(d_model, d_model, bias=False)
-        self.dropout_layer = nn.Dropout(dropout)
-        self.dropout_rate = dropout
-        self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
-        self.causal = causal
-    def forward(self, x_q, x_kv, seq_lens_q, seq_lens_kv):
-        # x_q should be of shape (total, d_model)
-        # x_kv should be of shape (total, d_model)
-        # seq_lens_q should be of shape (batch_size,) like (4, 3, 2, 23, 1, ...)
-        # seq_lens_kv should be of shape (batch_size,) like (4, 3, 2, 23, 1, ...)
-        drop_rate = self.dropout_rate if self.training else 0.0 # flash attention won't change dropout rate to 0 during eval automatically
-        residual = x_q
-        ################# YOUR CODE HERE #################
-        # 1. use self.w_q, self.w_kv to get q, k, v
-        q = self.w_q(x_q).view(-1, self.n_head, self.d_qkv)
-        kv = self.w_kv(x_kv).view(-1, 2, self.n_head, self.d_qkv)
-        k, v = kv.unbind(1)
+    def forward(self, q, k, v, mask=None):
 
-        # 2. change seq_lens to cu_seqlens by using seqlen2cu_len function
-        cu_seqlens_q = seqlen2cu_len(seq_lens_q)
-        cu_seqlens_kv = seqlen2cu_len(seq_lens_kv)
+        d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
+        sz_b, len_q, len_k, len_v = q.size(0), q.size(1), k.size(1), v.size(1)
 
-        # 3. get max_len_q and max_len_kv from seq_lens
-        max_len_q = seq_lens_q.max().item()
-        max_len_kv = seq_lens_kv.max().item()
-        ##################################################
-        # output shape: (total_tokens_q, n_head, d_kv)
-        output = flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_kv,
-            max_seqlen_q=max_len_q,
-            max_seqlen_k=max_len_kv,
-            dropout_p=drop_rate,
-            causal=self.causal, # flash attention will handle causal masking inside
-        )
-        ################# YOUR CODE HERE ###################
-        # 1. use self.w_o to project output back to d_model
-        output = self.w_o(output.reshape(-1, self.n_head * self.d_qkv))
-        
-        # 2. apply dropout, residual connection and layer norm
-        output = self.dropout_layer(output)
-        output += residual
-        output = self.layer_norm(output)
-        ##################################################
-        return output
-    
+        residual = q
+
+        # Pass through the pre-attention projection: b x lq x (n*dv)
+        # Separate different heads: b x lq x n x dv
+        q = self.w_qs(q).view(sz_b, len_q, n_head, d_k)
+        k = self.w_ks(k).view(sz_b, len_k, n_head, d_k)
+        v = self.w_vs(v).view(sz_b, len_v, n_head, d_v)
+
+        # Transpose for attention dot product: b x n x lq x dv
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+        if mask is not None:
+            mask = mask.unsqueeze(1)   # For head axis broadcasting.
+
+        q, attn = self.attention(q, k, v, mask=mask)
+
+        # Transpose to move the head dimension back: b x lq x n x dv
+        # Combine the last two dimensions to concatenate all the heads together: b x lq x (n*dv)
+        q = q.transpose(1, 2).contiguous().view(sz_b, len_q, -1)
+        q = self.dropout(self.fc(q))
+        q += residual
+
+        q = self.layer_norm(q)
+
+        return q, attn
+
+
 class PositionwiseFeedForward(nn.Module):
     ''' A two-feed-forward-layer module '''
 
