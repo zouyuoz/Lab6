@@ -114,7 +114,7 @@ from transformer.Const import *
 class Seq2SeqModelWithFlashAttn(nn.Module):
     def __init__(
         self,
-        transformer_model_path: str = "answerdotai/ModernBERT-base",
+        transformer_model_path: str = "bert-base-uncased",
         freeze_encoder: bool = True,
         weight_dtype: Optional[torch.dtype] = torch.bfloat16,
     ):
@@ -314,7 +314,15 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
     def _tie_decoder_embeddings(self) -> None:
         # Initialize decoder embeddings with encoder embeddings and decoder embeddings tie to output projection layer
         with torch.no_grad():
+            # 自動判斷是 BERT (word_embeddings) 還是 ModernBERT (tok_embeddings)
+            if hasattr(self.encoder.embeddings, "word_embeddings"):
+                encoder_embeddings = self.encoder.embeddings.word_embeddings
+            elif hasattr(self.encoder.embeddings, "tok_embeddings"):
+                encoder_embeddings = self.encoder.embeddings.tok_embeddings
+            else:
+                raise AttributeError("Cannot find embedding layer in encoder.embeddings")
+
             self.decoder.trg_word_emb.weight.copy_(
-                self.encoder.embeddings.tok_embeddings.weight
+                encoder_embeddings.weight
             )
         self.output_projection.weight = self.decoder.trg_word_emb.weight
