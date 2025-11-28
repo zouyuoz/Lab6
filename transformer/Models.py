@@ -122,8 +122,11 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
         encoder_kwargs = {}
         if weight_dtype is not None:
             encoder_kwargs["torch_dtype"] = weight_dtype
+        
+        # 這裡會載入標準 BERT
         self.encoder = AutoModel.from_pretrained(transformer_model_path, **encoder_kwargs)
         self.tokenizer = AutoTokenizer.from_pretrained(transformer_model_path)
+        
         self.decoder = Decoder(
             n_trg_vocab=len(self.tokenizer),
             d_word_vec=768,
@@ -137,80 +140,53 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             n_position=MAX_TARGET_LEN,
             dropout=0.1,
             flash_attn=True)
+            
         self.output_projection = nn.Linear(768, len(self.tokenizer), bias=False)
         self._cast_modules_to_dtype(weight_dtype)
         self._tie_decoder_embeddings()
+        
         if freeze_encoder:
             for param in self.encoder.parameters():
                 param.requires_grad = False
         self.weight_dtype = weight_dtype
+
     def forward(self, src_input_ids, trg_input_ids, src_seq_len, trg_seq_len):
-        # src_input and trg_input are assumed to be already tokenized and sequence packed.
-        # src_input and trg_input shape should be (total_seq_len, )
-        # Encode
-        dummy_mask = torch.tensor(1, device=src_input_ids.device)
-        bsz = src_seq_len.size(0)
-        src_cu_seqlens = seqlen2cu_len(src_seq_len)
-        max_src_len = src_seq_len.max().item()
-        enc_outputs = self.encoder(
-            input_ids=src_input_ids,
-            attention_mask=dummy_mask,
-            cu_seqlens=src_cu_seqlens,
-            max_seqlen=max_src_len,
-            batch_size=bsz
+        # src_input_ids: 1D Packed Tensor (Total_Tokens)
+        # src_seq_len: 1D Tensor (Batch_Size)
+
+        # 1. [轉接頭] Packed (1D) -> Padded (2D) for BERT
+        # 將 1D 壓扁的數據根據長度切開，並補 0 成 2D 矩陣
+        src_inputs_list = torch.split(src_input_ids, src_seq_len.tolist())
+        padded_input_ids = torch.nn.utils.rnn.pad_sequence(
+            src_inputs_list, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
-        enc_output = enc_outputs["last_hidden_state"] # shape: (total_src_seq_len, d_model)
-        assert enc_output.size(0) == src_input_ids.size(0), (enc_output.size(), src_input_ids.size())
+        
+        # 製作 BERT 需要的 Attention Mask (1 為有效, 0 為 Padding)
+        attention_mask = (padded_input_ids != self.tokenizer.pad_token_id).long()
+
+        # 2. Encoder Forward (Standard BERT)
+        enc_outputs = self.encoder(
+            input_ids=padded_input_ids,
+            attention_mask=attention_mask
+        )
+        last_hidden_state = enc_outputs.last_hidden_state # (B, Max_Len, H)
+
+        # 3. [轉接頭] Padded (2D) -> Packed (1D) for Custom Decoder
+        # 利用 mask 將補 0 的部分去掉，壓回 1D 給 Decoder 用
+        enc_output_packed = last_hidden_state[attention_mask.bool()]
+
+        # 4. Decoder Forward
         dec_output = self.decoder(
             trg_seq=trg_input_ids,
             trg_mask=trg_seq_len,
-            enc_output=enc_output,
+            enc_output=enc_output_packed,
             src_mask=src_seq_len
         )
+        
         # Project to vocabulary
         logits = self.output_projection(dec_output)
         return logits
     
-    def top_k_top_p_filtering(
-        self,
-        logits: torch.Tensor,
-        top_k,
-        top_p
-    ) -> torch.Tensor:
-        # logits: (bsz, vocab_size)
-        if logits.dim() == 1:
-            logits = logits.unsqueeze(0)
-        filter_value: float = -float('Inf')
-        vocab_size = logits.size(-1)
-        if top_k > 0 and top_k < vocab_size:
-            ############# YOUR CODE STARTS HERE #############
-            v, _ = torch.topk(logits, top_k)
-            # 取第 top_k 個值作為閾值
-            kth_value = v[:, -1].unsqueeze(-1)
-            logits[logits < kth_value] = filter_value
-            ###############################################
-            
-        if 0.0 < top_p < 1.0:
-            ############# YOUR CODE STARTS HERE #############
-            # 1. Sort logits
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            
-            # 2. Calculate softmax probabilities
-            probabilities = torch.softmax(sorted_logits, dim=-1)
-            
-            # 3. Calculate cumulative probabilities
-            cumulative_probabilities = torch.cumsum(probabilities, dim=-1)
-
-            # 4. Find tokens to remove
-            sorted_indices_to_remove = cumulative_probabilities > top_p
-            # Shift mask right to keep the first token above threshold
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = False
-            
-            # Scatter filtered values back
-            logits.scatter_(dim=-1, index=sorted_indices, src=filter_value * sorted_indices_to_remove)
-            ###############################################
-
     def generate(
         self,
         input_ids: torch.Tensor,
@@ -224,32 +200,33 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
         src_seq_len = src_seq_len.to(device=device, dtype=torch.int32)
         bsz = src_seq_len.size(0)
 
-        # 1. Encoder Step (Missing in your upload)
-        dummy_mask = torch.tensor(1, device=device)
-        src_cu_seqlens = seqlen2cu_len(src_seq_len)
-        max_src_len = src_seq_len.max().item()
-        enc_outputs = self.encoder(
-            input_ids=input_ids,
-            attention_mask=dummy_mask,
-            cu_seqlens=src_cu_seqlens,
-            max_seqlen=max_src_len,
-            batch_size=bsz
+        # 1. [轉接頭] Packed (1D) -> Padded (2D) for BERT
+        # 與 forward 相同的邏輯
+        src_inputs_list = torch.split(input_ids, src_seq_len.tolist())
+        padded_input_ids = torch.nn.utils.rnn.pad_sequence(
+            src_inputs_list, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
-        enc_output = enc_outputs["last_hidden_state"] # shape: (total_src_seq_len, d_model)
+        attention_mask = (padded_input_ids != self.tokenizer.pad_token_id).long()
+
+        # 2. Encoder Forward
+        enc_outputs = self.encoder(
+            input_ids=padded_input_ids,
+            attention_mask=attention_mask
+        )
+        last_hidden_state = enc_outputs.last_hidden_state
         
-        # 2. Initialization (Missing in your upload)
-        bos_id = self.tokenizer.cls_token_id # Use CLS_ID as BOS based on Const.py
-        # Store sequences as tensors for efficiency
+        # 3. [轉接頭] Padded (2D) -> Packed (1D)
+        enc_output = last_hidden_state[attention_mask.bool()]
+        
+        # 4. Initialization
+        bos_id = self.tokenizer.cls_token_id 
         sequences: List[torch.Tensor] = [torch.tensor([bos_id], dtype=torch.long, device=device) for _ in range(bsz)]
         finished = torch.zeros(bsz, dtype=torch.bool, device=device)
 
         for _ in range(generation_limit):
-            ############### YOUR CODE STARTS HERE #############
-            # 1. PREPARE trg_input_ids AND trg_seq_len FROM sequences
             trg_input_ids = torch.cat(sequences)
             trg_seq_len = torch.tensor([s.size(0) for s in sequences], dtype=torch.int32, device=device)
 
-            # 2. CALL THE DECODER AND OUTPUT PROJECTION TO GET next_token_logits
             dec_output = self.decoder(
                 trg_seq=trg_input_ids,
                 trg_mask=trg_seq_len,
@@ -257,28 +234,17 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
                 src_mask=src_seq_len
             )
             
-            # Project to vocabulary
-            logits = self.output_projection(dec_output) # (total_trg_tokens, vocab_size)
-
-            # Get the logit for the next token (the logit of the last token in each sequence)
+            logits = self.output_projection(dec_output) 
             cu_seqlens_no_pad = torch.cumsum(trg_seq_len, dim=0, dtype=torch.long)
             last_token_indices = cu_seqlens_no_pad - 1 
-            
             next_token_logits = logits[last_token_indices]
-            ###################################################
 
             if finished.any():
                 next_token_logits[finished] = -float("inf")
-                next_token_logits[
-                    finished, self.tokenizer.pad_token_id
-                ] = 0.0  # keep PAD sticky
+                next_token_logits[finished, self.tokenizer.pad_token_id] = 0.0
 
             if sampling:
-                filtered_logits = self.top_k_top_p_filtering(
-                    next_token_logits,
-                    top_k=top_k,
-                    top_p=top_p,
-                )
+                filtered_logits = self.top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
                 probabilities = torch.softmax(filtered_logits, dim=-1)
                 next_token = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
             else:
@@ -287,9 +253,7 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             for idx in range(bsz):
                 if finished[idx]:
                     continue
-                sequences[idx] = torch.cat(
-                    [sequences[idx], next_token[idx].view(1)]
-                )
+                sequences[idx] = torch.cat([sequences[idx], next_token[idx].view(1)])
                 if next_token[idx].item() == self.tokenizer.sep_token_id:
                     finished[idx] = True
 
@@ -312,9 +276,8 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
         self.output_projection.to(dtype=dtype)
 
     def _tie_decoder_embeddings(self) -> None:
-        # Initialize decoder embeddings with encoder embeddings and decoder embeddings tie to output projection layer
         with torch.no_grad():
-            # 自動判斷是 BERT (word_embeddings) 還是 ModernBERT (tok_embeddings)
+            # 兼容 BERT (word_embeddings)
             if hasattr(self.encoder.embeddings, "word_embeddings"):
                 encoder_embeddings = self.encoder.embeddings.word_embeddings
             elif hasattr(self.encoder.embeddings, "tok_embeddings"):
@@ -322,7 +285,26 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             else:
                 raise AttributeError("Cannot find embedding layer in encoder.embeddings")
 
-            self.decoder.trg_word_emb.weight.copy_(
-                encoder_embeddings.weight
-            )
+            self.decoder.trg_word_emb.weight.copy_(encoder_embeddings.weight)
         self.output_projection.weight = self.decoder.trg_word_emb.weight
+
+    def top_k_top_p_filtering(self, logits, top_k, top_p):
+        # 這裡保留原本邏輯即可，不需要修改
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+        filter_value: float = -float('Inf')
+        vocab_size = logits.size(-1)
+        if top_k > 0 and top_k < vocab_size:
+            v, _ = torch.topk(logits, top_k)
+            kth_value = v[:, -1].unsqueeze(-1)
+            logits[logits < kth_value] = filter_value
+            
+        if 0.0 < top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            probabilities = torch.softmax(sorted_logits, dim=-1)
+            cumulative_probabilities = torch.cumsum(probabilities, dim=-1)
+            sorted_indices_to_remove = cumulative_probabilities > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = False
+            logits.scatter_(dim=-1, index=sorted_indices, src=filter_value * sorted_indices_to_remove)
+        return logits
