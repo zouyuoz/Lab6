@@ -1,4 +1,23 @@
-/checkpoints/
-/__pycache__/
-/transformer/__pycache__/
-/dataset/
+transformer/__pycache__/
+dataset/
+
+# 虛擬環境
+.venv/
+venv/
+ENV/
+
+# Python 快取和編譯文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# 專案產生的日誌、數據、模型等
+*.log
+*.data
+/checkpoints/ # 確保這個也在，用於大模型文件
+
+# 作業系統和編輯器文件
+.DS_Store
+.vscode/
