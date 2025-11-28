@@ -20,13 +20,12 @@ class MultiHeadSelfAttention_Flash(nn.Module):
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
         self.causal = causal
     def forward(self, x, seq_lens):
-        # x should be of shape (total_len, d_model)
-        # seq_lens should be of shape (batch_size,) like (4, 3, 2, 23, 1, ...)
         drop_rate = self.dropout_rate if self.training else 0.0
         residual = x
         ################# YOUR CODE HERE #################
         # 1. use self.w_qkv to get qkv and reshape to (total_len, 3, n_head, d_qkv)
         qkv = self.w_qkv(x)
+        # Reshape: (B*L, 3, H, D) -> (total_tokens, 3, n_head, d_qkv)
         qkv_packed = qkv.view(-1, 3, self.n_head, self.d_qkv) 
 
         # 2. change seq_lens to cu_seqlens by using seqlen2cu_len function
@@ -38,6 +37,7 @@ class MultiHeadSelfAttention_Flash(nn.Module):
         
         output = flash_attn_varlen_qkvpacked_func(qkv_packed, cu_seqlens, max_len, dropout_p=drop_rate, causal=self.causal)
         output = output.reshape(-1, self.n_head * self.d_qkv)
+        
         ################# YOUR CODE HERE ###################
         # 1. use self.w_o to project output back to d_model
         output = self.w_o(output)
@@ -62,43 +62,39 @@ class MultiHeadCrossAttention_Flash(nn.Module):
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
         self.causal = causal
     def forward(self, x_q, x_kv, seq_lens_q, seq_lens_kv):
-        # x_q should be of shape (total, d_model)
-        # x_kv should be of shape (total, d_model)
-        # seq_lens_q should be of shape (batch_size,) like (4, 3, 2, 23, 1, ...)
-        # seq_lens_kv should be of shape (batch_size,) like (4, 3, 2, 23, 1, ...)
-        drop_rate = self.dropout_rate if self.training else 0.0 # flash attention won't change dropout rate to 0 during eval automatically
+        drop_rate = self.dropout_rate if self.training else 0.0
         residual = x_q
         ################# YOUR CODE HERE #################
         # 1. use self.w_q, self.w_kv to get q, k, v
         q = self.w_q(x_q).view(-1, self.n_head, self.d_qkv)
+        # kv shape: (total, 2, n_head, d_qkv)
         kv = self.w_kv(x_kv).view(-1, 2, self.n_head, self.d_qkv)
         k, v = kv.unbind(1)
 
-        # 2. change seq_lens to cu_seqlens by using seqlen2cu_len function
+        # 2. change seq_lens to cu_seqlens
         cu_seqlens_q = seqlen2cu_len(seq_lens_q)
         cu_seqlens_kv = seqlen2cu_len(seq_lens_kv)
 
-        # 3. get max_len_q and max_len_kv from seq_lens
+        # 3. get max_len
         max_len_q = seq_lens_q.max().item()
         max_len_kv = seq_lens_kv.max().item()
         ##################################################
-        # output shape: (total_tokens_q, n_head, d_kv)
+        
         output = flash_attn_varlen_func(
-            q,
-            k,
-            v,
+            q, k, v,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_kv,
             max_seqlen_q=max_len_q,
             max_seqlen_k=max_len_kv,
             dropout_p=drop_rate,
-            causal=self.causal, # flash attention will handle causal masking inside
+            causal=self.causal,
         )
+        
         ################# YOUR CODE HERE ###################
-        # 1. use self.w_o to project output back to d_model
+        # 1. Project back
         output = self.w_o(output.reshape(-1, self.n_head * self.d_qkv))
         
-        # 2. apply dropout, residual connection and layer norm
+        # 2. apply dropout, residual, layer norm
         output = self.dropout_layer(output)
         output += residual
         output = self.layer_norm(output)

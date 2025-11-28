@@ -80,10 +80,7 @@ class Decoder(nn.Module):
 
     def forward(self, trg_seq, trg_mask, enc_output, src_mask):
         ######### YOUR CODE STARTS HERE #########
-        # HINTS:
-        # 1. IF flash_attn is True, trg_mask and src_mask are SEQ_LEN tensors.
-        # 2. Process will be embedding -> positional encoding -> dropout -> decoder layers -> layer norm
-        #########################################
+        # 這裡的 trg_mask 和 src_mask 實際上傳入的是 seq_lens
         trg_seq_lens = trg_mask
         enc_seq_lens = src_mask
 
@@ -107,7 +104,7 @@ class Decoder(nn.Module):
             
         # 5. Layer Norm
         dec_output = self.layer_norm(dec_output)
-        
+        #########################################
         return dec_output
 
 
@@ -187,22 +184,14 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
         vocab_size = logits.size(-1)
         if top_k > 0 and top_k < vocab_size:
             ############# YOUR CODE STARTS HERE #############
-            # HINT:
-            # USE torch.topk TO GET THE TOP-K LOGITS AND SET OTHERS TO filter_value
             v, _ = torch.topk(logits, top_k)
+            # 取第 top_k 個值作為閾值
             kth_value = v[:, -1].unsqueeze(-1)
             logits[logits < kth_value] = filter_value
             ###############################################
             
-        
         if 0.0 < top_p < 1.0:
             ############# YOUR CODE STARTS HERE #############
-            # HINTS:
-            # 1. USE torch.sort TO SORT THE LOGITS
-            # 2. CALCULATE SOFTMAX PROBABILITIES UNDER FILTERED LOGITS
-            # 3. CALCULATE CUMULATIVE PROBABILITIES
-            # 4. SET LOGITS WITH CUMULATIVE PROBABILITIES > top_p TO filter_value
-            
             # 1. Sort logits
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
             
@@ -212,16 +201,15 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             # 3. Calculate cumulative probabilities
             cumulative_probabilities = torch.cumsum(probabilities, dim=-1)
 
-            # 4. Find the tokens to remove
-            # Shift the mask to the right to keep the last token that is still below top_p
+            # 4. Find tokens to remove
             sorted_indices_to_remove = cumulative_probabilities > top_p
+            # Shift mask right to keep the first token above threshold
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
             sorted_indices_to_remove[..., 0] = False
             
-            # Set the logits to filter_value
+            # Scatter filtered values back
             logits.scatter_(dim=-1, index=sorted_indices, src=filter_value * sorted_indices_to_remove)
             ###############################################
-        return logits # YOU NEED TO RETURN THE FILTERED RAW LOGITS, NOT PROBABILITIES
 
     def generate(
         self,
