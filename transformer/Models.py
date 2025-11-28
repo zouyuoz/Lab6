@@ -108,13 +108,13 @@ class Decoder(nn.Module):
         return dec_output
 
 
-from transformers import AutoModel, AutoTokenizer
+from transformers import ModernBertModel, AutoTokenizer
 from transformer.Const import *
 
 class Seq2SeqModelWithFlashAttn(nn.Module):
     def __init__(
         self,
-        transformer_model_path: str = "bert-base-uncased",
+        transformer_model_path: str = "answerdotai/ModernBERT-base",
         freeze_encoder: bool = True,
         weight_dtype: Optional[torch.dtype] = torch.bfloat16,
     ):
@@ -124,7 +124,7 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             encoder_kwargs["torch_dtype"] = weight_dtype
         
         # 這裡會載入標準 BERT
-        self.encoder = AutoModel.from_pretrained(transformer_model_path, **encoder_kwargs)
+        self.encoder = ModernBertModel.from_pretrained(transformer_model_path, **encoder_kwargs)
         self.tokenizer = AutoTokenizer.from_pretrained(transformer_model_path)
         
         self.decoder = Decoder(
