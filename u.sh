@@ -3,7 +3,7 @@
 # 1. 定義變數
 REPO_DIR="$(dirname "$0")" # 取得腳本所在的目錄（即 Lab5 專案根目錄）
 COMMIT_MESSAGE=""
-DEFAULT_MESSAGE="Auto-update from Colab at $(date +'%Y-%m-%d %H:%M:%S')"
+DEFAULT_MESSAGE="Auto-update from USA at $(date +'%Y-%m-%d %H:%M:%S')"
 
 # 2. 進入專案根目錄
 cd "$REPO_DIR" || { echo "錯誤：無法進入專案目錄 $REPO_DIR。請檢查腳本位置。"; exit 1; }

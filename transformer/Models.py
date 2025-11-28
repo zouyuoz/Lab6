@@ -108,7 +108,7 @@ class Decoder(nn.Module):
         return dec_output
 
 
-from transformers import ModernBertModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer
 from transformer.Const import *
 
 class Seq2SeqModelWithFlashAttn(nn.Module):
@@ -122,7 +122,7 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
         encoder_kwargs = {}
         if weight_dtype is not None:
             encoder_kwargs["torch_dtype"] = weight_dtype
-        self.encoder = ModernBertModel.from_pretrained(transformer_model_path, **encoder_kwargs)
+        self.encoder = AutoModel.from_pretrained(transformer_model_path, **encoder_kwargs)
         self.tokenizer = AutoTokenizer.from_pretrained(transformer_model_path)
         self.decoder = Decoder(
             n_trg_vocab=len(self.tokenizer),
