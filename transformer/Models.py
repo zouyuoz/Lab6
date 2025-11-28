@@ -288,8 +288,13 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             self.decoder.trg_word_emb.weight.copy_(encoder_embeddings.weight)
         self.output_projection.weight = self.decoder.trg_word_emb.weight
 
-    def top_k_top_p_filtering(self, logits, top_k, top_p):
-        # 這裡保留原本邏輯即可，不需要修改
+    def top_k_top_p_filtering(
+        self,
+        logits: torch.Tensor,
+        top_k,
+        top_p
+    ) -> torch.Tensor:
+        # logits: (bsz, vocab_size)
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
         filter_value: float = -float('Inf')
@@ -300,11 +305,25 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             logits[logits < kth_value] = filter_value
             
         if 0.0 < top_p < 1.0:
+            # 1. Sort logits
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            
+            # 2. Calculate softmax probabilities
             probabilities = torch.softmax(sorted_logits, dim=-1)
+            
+            # 3. Calculate cumulative probabilities
             cumulative_probabilities = torch.cumsum(probabilities, dim=-1)
+
+            # 4. Find tokens to remove
             sorted_indices_to_remove = cumulative_probabilities > top_p
+            # Shift mask right to keep the first token above threshold
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
             sorted_indices_to_remove[..., 0] = False
-            logits.scatter_(dim=-1, index=sorted_indices, src=filter_value * sorted_indices_to_remove)
+            
+            # Scatter filtered values back
+            # 修正：使用 scatter 建立 mask，然後直接將對應位置設為 filter_value
+            # 這樣可以避免 dtype 不匹配的問題，並且正確保留未被過濾的 logits 值
+            indices_to_remove = torch.zeros_like(logits, dtype=torch.bool).scatter_(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
+            logits[indices_to_remove] = filter_value
+
         return logits
