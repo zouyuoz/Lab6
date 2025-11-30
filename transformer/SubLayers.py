@@ -6,6 +6,7 @@ import torch
 import flash_attn
 from flash_attn import flash_attn_varlen_qkvpacked_func, flash_attn_varlen_func
 from transformer.utils import seqlen2cu_len
+
 class MultiHeadSelfAttention_Flash(nn.Module):
     ''' Multi-Head self Attention module with Flash Attention '''
 
@@ -13,39 +14,49 @@ class MultiHeadSelfAttention_Flash(nn.Module):
         super().__init__()
         self.n_head = n_head
         self.d_qkv = d_qkv
-        self.w_qkv = nn.Linear(d_model, 3 * d_model, bias=False) # QKV projection (d_model -> 3 * d_model)
-        self.w_o = nn.Linear(d_model, d_model, bias=False) # Output projection (d_model -> d_model)
+        self.w_qkv = nn.Linear(d_model, 3 * d_model, bias=False) # QKV projection
+        self.w_o = nn.Linear(d_model, d_model, bias=False) # Output projection
         self.dropout_rate = dropout
         self.dropout_layer = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
         self.causal = causal
+
     def forward(self, x, seq_lens):
         drop_rate = self.dropout_rate if self.training else 0.0
         residual = x
+        
+        # --- Pre-Norm 修改重點: 先做 Norm ---
+        x = self.layer_norm(x)
+        # ----------------------------------
+
         ################# YOUR CODE HERE #################
-        # 1. use self.w_qkv to get qkv and reshape to (total_len, 3, n_head, d_qkv)
+        # 1. use self.w_qkv to get qkv
         qkv = self.w_qkv(x)
-        # Reshape: (B*L, 3, H, D) -> (total_tokens, 3, n_head, d_qkv)
         qkv_packed = qkv.view(-1, 3, self.n_head, self.d_qkv) 
 
-        # 2. change seq_lens to cu_seqlens by using seqlen2cu_len function
+        # 2. change seq_lens to cu_seqlens
         cu_seqlens = seqlen2cu_len(seq_lens)
         
-        # 3. get max_len from seq_lens
+        # 3. get max_len
         max_len = seq_lens.max().item()
         ##################################################
         
-        output = flash_attn_varlen_qkvpacked_func(qkv_packed, cu_seqlens, max_len, dropout_p=drop_rate, causal=self.causal)
+        output = flash_attn_varlen_qkvpacked_func(
+            qkv_packed, cu_seqlens, max_len, dropout_p=drop_rate, causal=self.causal
+        )
         output = output.reshape(-1, self.n_head * self.d_qkv)
         
         ################# YOUR CODE HERE ###################
         # 1. use self.w_o to project output back to d_model
         output = self.w_o(output)
         
-        # 2. apply dropout, residual connection and layer norm
+        # 2. apply dropout
         output = self.dropout_layer(output)
+        
+        # --- Pre-Norm 修改重點: 最後只加 Residual，不再 Norm ---
         output += residual
-        output = self.layer_norm(output)
+        # output = self.layer_norm(output)  <-- 移除這一行
+        # ----------------------------------------------------
         ##################################################
         return output
 
@@ -61,13 +72,18 @@ class MultiHeadCrossAttention_Flash(nn.Module):
         self.dropout_rate = dropout
         self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
         self.causal = causal
+
     def forward(self, x_q, x_kv, seq_lens_q, seq_lens_kv):
         drop_rate = self.dropout_rate if self.training else 0.0
         residual = x_q
+        
+        # --- Pre-Norm 修改重點: 先對 Query 做 Norm ---
+        x_q = self.layer_norm(x_q)
+        # -------------------------------------------
+
         ################# YOUR CODE HERE #################
-        # 1. use self.w_q, self.w_kv to get q, k, v
+        # 1. use self.w_q, self.w_kv
         q = self.w_q(x_q).view(-1, self.n_head, self.d_qkv)
-        # kv shape: (total, 2, n_head, d_qkv)
         kv = self.w_kv(x_kv).view(-1, 2, self.n_head, self.d_qkv)
         k, v = kv.unbind(1)
 
@@ -94,10 +110,13 @@ class MultiHeadCrossAttention_Flash(nn.Module):
         # 1. Project back
         output = self.w_o(output.reshape(-1, self.n_head * self.d_qkv))
         
-        # 2. apply dropout, residual, layer norm
+        # 2. apply dropout
         output = self.dropout_layer(output)
+        
+        # --- Pre-Norm 修改重點: 最後只加 Residual ---
         output += residual
-        output = self.layer_norm(output)
+        # output = self.layer_norm(output) <-- 移除這一行
+        # ------------------------------------------
         ##################################################
         return output
     
@@ -112,13 +131,18 @@ class PositionwiseFeedForward(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-
         residual = x
+        
+        # --- Pre-Norm 修改重點: 先做 Norm ---
+        x = self.layer_norm(x)
+        # ----------------------------------
 
         x = self.w_2(F.relu(self.w_1(x)))
         x = self.dropout(x)
+        
+        # --- Pre-Norm 修改重點: 最後只加 Residual ---
         x += residual
-
-        x = self.layer_norm(x)
+        # x = self.layer_norm(x) <-- 移除這一行
+        # ------------------------------------------
 
         return x

@@ -21,3 +21,7 @@ __pycache__/
 # 作業系統和編輯器文件
 .DS_Store
 .vscode/
+
+*.csv
+*.png
+*.pt
