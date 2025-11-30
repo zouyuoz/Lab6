@@ -16,7 +16,7 @@ __pycache__/
 # 專案產生的日誌、數據、模型等
 *.log
 *.data
-/checkpoints/ # 確保這個也在，用於大模型文件
+/checkpoints/
 
 # 作業系統和編輯器文件
 .DS_Store
@@ -25,3 +25,6 @@ __pycache__/
 *.csv
 *.png
 *.pt
+
+/_log/
+/_result/
