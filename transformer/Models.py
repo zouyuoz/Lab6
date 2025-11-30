@@ -135,7 +135,7 @@ class Seq2SeqModelWithFlashAttn(nn.Module):
             d_k=768 // 12,
             d_v=768 // 12,
             d_model=768,
-            d_inner=768 * 2,
+            d_inner=768 * 4,
             pad_idx=self.tokenizer.pad_token_id,
             n_position=MAX_TARGET_LEN,
             dropout=0.1,
